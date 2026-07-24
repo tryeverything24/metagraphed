@@ -72,7 +72,12 @@ import {
   listSubscribableMcpResourceClasses,
   parseSubnetStatusResourceUri,
 } from "./subnet-status-subscribe.ts";
-import { CONTRACT_VERSION, PRIMARY_DOMAIN, QUERY_ENUMS } from "./contracts.ts";
+import {
+  API_QUERY_COLLECTIONS,
+  CONTRACT_VERSION,
+  PRIMARY_DOMAIN,
+  QUERY_ENUMS,
+} from "./contracts.ts";
 import {
   GET_ECONOMICS_INSTRUCTIONS,
   GET_ECONOMICS_MCP_TOOL,
@@ -777,6 +782,11 @@ export const MCP_SERVER_VERSION = "1.78.9";
 // warns. All units are percent, matching the quote's `price_impact_pct`.
 const STAKE_PREVIEW_IMPACT_NOTICE_PCT = 1;
 const STAKE_PREVIEW_IMPACT_MAX_PCT = 5;
+
+// Sortable fields for the generalized endpoints collection, shared with the REST
+// route and the sibling modular endpoint tools (list_subnet_endpoints /
+// list_provider_endpoints) so list_endpoints sorts on exactly the same contract.
+const ENDPOINT_SORT_FIELDS = API_QUERY_COLLECTIONS.endpoints.sort_fields;
 
 // Derive the plan-shaped advisory (a `plan`-convention `warnings[]` + policy
 // `ok` flag) purely from a computed stake quote's price impact — the one signal
@@ -9690,8 +9700,9 @@ export const MCP_TOOLS = [
       "probe-derived status/latency/score. Use it to discover live endpoints " +
       "network-wide. Optionally filter by kind/layer/netuid/provider/" +
       "publication_state/status/pool_eligible, bound by min_/max_latency_ms " +
-      "and min_/max_score, and page with limit/cursor — the full catalog can " +
-      "be large. Mirrors GET /api/v1/endpoints.",
+      "and min_/max_score, sort with sort + order, project columns with fields, " +
+      "and page with limit/cursor — the full catalog can be large. Mirrors " +
+      "GET /api/v1/endpoints.",
     inputSchema: {
       type: "object",
       properties: {
@@ -9741,6 +9752,21 @@ export const MCP_TOOLS = [
           type: "number",
           description: "Only endpoints with probe-derived score <= this.",
         },
+        sort: {
+          type: "string",
+          enum: ENDPOINT_SORT_FIELDS,
+          description: "Field to sort by before paging.",
+        },
+        order: {
+          type: "string",
+          enum: ["asc", "desc"],
+          description: "Sort direction for `sort` (default asc).",
+        },
+        fields: {
+          type: "string",
+          description:
+            "Comma-separated projection of endpoint row fields to return.",
+        },
         limit: {
           type: "integer",
           description: "Max endpoints to return. Omit for the full list.",
@@ -9780,6 +9806,14 @@ export const MCP_TOOLS = [
         .map(({ field, op, arg }) => ({ field, op, limit: args[arg] }));
       const limit = optionalPositiveInt(args, "limit");
       const cursor = optionalNonNegativeInt(args, "cursor") ?? 0;
+      // Sort/order/field-projection mirror the REST endpoints route and the
+      // sibling modular tools (list_subnet_endpoints / list_provider_endpoints):
+      // validate sort/order against the shared endpoints contract, pass `fields`
+      // through as a comma-separated projection, and let applyQueryFilters apply
+      // them over the already-filtered rows below.
+      const sort = optionalEnum(args, "sort", ENDPOINT_SORT_FIELDS);
+      const order = optionalEnum(args, "order", ["asc", "desc"]);
+      const fields = optionalString(args, "fields");
       let data = await loadArtifactData(ctx, "/metagraph/endpoints.json");
       // Live per-endpoint health overlay (mirrors workers/api.mjs's raw-
       // artifact serving path): the build-time endpoints.json bakes stale
@@ -9814,20 +9848,41 @@ export const MCP_TOOLS = [
             return op === "min" ? value >= bound : value <= bound;
           }),
       );
-      const window = cursorWindow(filtered, {
-        collection: "endpoints",
-        dataKey: "endpoints",
-        limit,
-        cursor,
-      });
+      // Sort, project (fields), and page the already-filtered rows through the
+      // shared list-query transform — the same machinery the REST route and the
+      // sibling modular endpoint tools run, driven off the endpoints collection.
+      const query = new URL("https://mcp.internal/endpoints");
+      if (sort) query.searchParams.set("sort", sort);
+      if (order) query.searchParams.set("order", order);
+      if (fields) query.searchParams.set("fields", fields);
+      if (limit != null) query.searchParams.set("limit", String(limit));
+      if (cursor > 0) query.searchParams.set("cursor", String(cursor));
+      const transformed = applyQueryFilters(
+        { ...data, endpoints: filtered },
+        query,
+        "endpoints",
+        [],
+      ) as {
+        data: { endpoints: Row[] };
+        meta: { pagination: Row };
+        error?: { message: string };
+      };
+      if (transformed.error) {
+        throw toolError("invalid_params", transformed.error.message);
+      }
+      const page = transformed.meta.pagination;
       return {
         ...data,
-        endpoints: window.page,
-        total: window.total,
-        returned: window.returned,
-        cursor: window.cursor,
-        limit: window.limit,
-        next_cursor: window.next_cursor,
+        endpoints: transformed.data.endpoints,
+        total: page.total,
+        returned: page.returned,
+        cursor: page.cursor,
+        limit: page.limit,
+        // Echo the applied ordering and projection so an agent can confirm what
+        // it got, mirroring the REST list meta and the sibling endpoint tools.
+        sort: page.sort,
+        order: page.order,
+        next_cursor: page.next_cursor,
       };
     },
   },
@@ -15468,6 +15523,8 @@ const TOOL_OUTPUT_SCHEMAS = {
       returned: { type: "integer" },
       cursor: { type: "integer" },
       limit: { type: "integer" },
+      sort: NULLABLE_STRING,
+      order: NULLABLE_STRING,
       next_cursor: { type: ["integer", "null"] },
       generated_at: NULLABLE_STRING,
       schema_version: { type: ["string", "integer", "null"] },

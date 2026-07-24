@@ -16212,6 +16212,74 @@ describe("MCP parity tools — provider + discovery bundle (artifact-backed)", (
     assert.equal(out.endpoints[0].netuid, 2);
   });
 
+  // #7892: sort/order/fields parity with GET /api/v1/endpoints and the sibling
+  // modular endpoint tools (list_subnet_endpoints / list_provider_endpoints).
+  function endpointsSortDeps() {
+    return makeDeps({
+      "/metagraph/endpoints.json": {
+        generated_at: "2026-01-01T00:00:00Z",
+        endpoints: [
+          { netuid: 7, provider: "datura", latency_ms: 300, score: 0.5 },
+          { netuid: 2, provider: "chutes", latency_ms: 100, score: 0.9 },
+          { netuid: 5, provider: "nova", latency_ms: 200, score: 0.7 },
+        ],
+      },
+    });
+  }
+
+  test("list_endpoints sorts by a field with asc/desc order", async () => {
+    const deps = endpointsSortDeps();
+    const asc = (
+      await callTool(
+        "list_endpoints",
+        { sort: "latency_ms", order: "asc" },
+        { deps },
+      )
+    ).body.result.structuredContent;
+    assert.deepEqual(
+      asc.endpoints.map((e: Row) => e.netuid),
+      [2, 5, 7],
+    );
+    assert.equal(asc.sort, "latency_ms");
+    assert.equal(asc.order, "asc");
+
+    const desc = (
+      await callTool(
+        "list_endpoints",
+        { sort: "latency_ms", order: "desc" },
+        { deps },
+      )
+    ).body.result.structuredContent;
+    assert.deepEqual(
+      desc.endpoints.map((e: Row) => e.netuid),
+      [7, 5, 2],
+    );
+    assert.equal(desc.order, "desc");
+  });
+
+  test("list_endpoints projects only the requested fields", async () => {
+    const deps = endpointsSortDeps();
+    const out = (
+      await callTool("list_endpoints", { fields: "netuid,provider" }, { deps })
+    ).body.result.structuredContent;
+    assert.deepEqual(Object.keys(out.endpoints[0]).sort(), [
+      "netuid",
+      "provider",
+    ]);
+    assert.equal(out.endpoints[0].latency_ms, undefined);
+  });
+
+  test("list_endpoints rejects a fields projection naming an unknown column", async () => {
+    const deps = endpointsSortDeps();
+    const res = await callTool(
+      "list_endpoints",
+      { fields: "netuid,not_a_column" },
+      { deps },
+    );
+    assert.equal(res.body.result.isError, true);
+    assert.match(res.body.result.content[0].text, /invalid_params/);
+  });
+
   test("list_evidence returns filtered claim rows", async () => {
     const deps = makeDeps({
       "/metagraph/evidence-ledger.json": {
